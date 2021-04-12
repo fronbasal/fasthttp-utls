@@ -3,7 +3,6 @@ package fasthttp
 import (
 	"bufio"
 	"bytes"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	tls "github.com/refraction-networking/utls"
 )
 
 // Do performs the given http request and fills the given http response.
@@ -207,6 +208,14 @@ type Client struct {
 	// Default TLS config is used if not set.
 	TLSConfig *tls.Config
 
+	// uTLS ClientHelloID for uTLS connection
+	//
+	// HelloRandomizedALPN is used if not set
+	ClientHelloID *tls.ClientHelloID
+
+	// uTLS ClientHelloSpec
+	ClientHelloSpec tls.ClientHelloSpec
+
 	// Maximum number of connections per each host which may be established.
 	//
 	// DefaultMaxConnsPerHost is used if not set.
@@ -294,9 +303,9 @@ type Client struct {
 	// By default will use isIdempotent function
 	RetryIf RetryIfFunc
 
-	mLock sync.Mutex
-	m     map[string]*HostClient
-	ms    map[string]*HostClient
+	mLock      sync.Mutex
+	m          map[string]*HostClient
+	ms         map[string]*HostClient
 	readerPool sync.Pool
 	writerPool sync.Pool
 }
@@ -492,6 +501,8 @@ func (c *Client) Do(req *Request, resp *Response) error {
 			DialDualStack:                 c.DialDualStack,
 			IsTLS:                         isTLS,
 			TLSConfig:                     c.TLSConfig,
+			ClientHelloID:                 c.ClientHelloID,
+			ClientHelloSpec:               c.ClientHelloSpec,
 			MaxConns:                      c.MaxConnsPerHost,
 			MaxIdleConnDuration:           c.MaxIdleConnDuration,
 			MaxConnDuration:               c.MaxConnDuration,
@@ -645,6 +656,12 @@ type HostClient struct {
 
 	// Optional TLS config.
 	TLSConfig *tls.Config
+
+	// Optional uTLS ClientHelloID
+	ClientHelloID *tls.ClientHelloID
+
+	// Optional uTLS ClientHelloSpec
+	ClientHelloSpec tls.ClientHelloSpec
 
 	// Maximum number of connections which may be established to all hosts
 	// listed in Addr.
@@ -1392,6 +1409,7 @@ func (c *HostClient) doNonNilReqResp(req *Request, resp *Response) (bool, error)
 	if len(userAgentOld) == 0 {
 		req.Header.userAgent = append(req.Header.userAgent[:0], c.getClientName()...)
 	}
+
 	bw := c.acquireWriter(conn)
 	err = req.Write(bw)
 
@@ -1900,7 +1918,7 @@ func (c *HostClient) dialHostHard() (conn net.Conn, err error) {
 	for n > 0 {
 		addr := c.nextAddr()
 		tlsConfig := c.cachedTLSConfig(addr)
-		conn, err = dialAddr(addr, c.Dial, c.DialDualStack, c.IsTLS, tlsConfig, c.WriteTimeout)
+		conn, err = dialAddr(addr, c.Dial, c.DialDualStack, c.IsTLS, tlsConfig, c.ClientHelloID, c.ClientHelloSpec, c.WriteTimeout)
 		if err == nil {
 			return conn, nil
 		}
@@ -1936,7 +1954,7 @@ var ErrTLSHandshakeTimeout = errors.New("tls handshake timed out")
 
 var timeoutErrorChPool sync.Pool
 
-func tlsClientHandshake(rawConn net.Conn, tlsConfig *tls.Config, timeout time.Duration) (net.Conn, error) {
+func tlsClientHandshake(rawConn net.Conn, tlsConfig *tls.Config, clientHelloID tls.ClientHelloID, clientHelloSpec tls.ClientHelloSpec, timeout time.Duration) (net.Conn, error) {
 	tc := AcquireTimer(timeout)
 	defer ReleaseTimer(tc)
 
@@ -1948,7 +1966,15 @@ func tlsClientHandshake(rawConn net.Conn, tlsConfig *tls.Config, timeout time.Du
 	ch = chv.(chan error)
 	defer timeoutErrorChPool.Put(chv)
 
-	conn := tls.Client(rawConn, tlsConfig)
+	conn := tls.UClient(rawConn, tlsConfig, clientHelloID)
+	// Use uTLS client here
+	if &clientHelloSpec != nil {
+		conn = tls.UClient(rawConn, tlsConfig, clientHelloID)
+		err := conn.ApplyPreset(&clientHelloSpec)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	go func() {
 		ch <- conn.Handshake()
@@ -1968,7 +1994,7 @@ func tlsClientHandshake(rawConn net.Conn, tlsConfig *tls.Config, timeout time.Du
 	}
 }
 
-func dialAddr(addr string, dial DialFunc, dialDualStack, isTLS bool, tlsConfig *tls.Config, timeout time.Duration) (net.Conn, error) {
+func dialAddr(addr string, dial DialFunc, dialDualStack, isTLS bool, tlsConfig *tls.Config, clientHelloID *tls.ClientHelloID, clientHelloSpec tls.ClientHelloSpec, timeout time.Duration) (net.Conn, error) {
 	if dial == nil {
 		if dialDualStack {
 			dial = DialDualStack
@@ -1976,6 +2002,10 @@ func dialAddr(addr string, dial DialFunc, dialDualStack, isTLS bool, tlsConfig *
 			dial = Dial
 		}
 		addr = addMissingPort(addr, isTLS)
+	}
+	// use HelloChrome_Auto by default
+	if clientHelloID == nil {
+		clientHelloID = &tls.HelloChrome_Auto
 	}
 	conn, err := dial(addr)
 	if err != nil {
@@ -1987,9 +2017,12 @@ func dialAddr(addr string, dial DialFunc, dialDualStack, isTLS bool, tlsConfig *
 	_, isTLSAlready := conn.(*tls.Conn)
 	if isTLS && !isTLSAlready {
 		if timeout == 0 {
-			return tls.Client(conn, tlsConfig), nil
+			if &clientHelloSpec != nil {
+				return tls.UClient(conn, tlsConfig, *&tls.HelloCustom), nil
+			}
+			return tls.UClient(conn, tlsConfig, *clientHelloID), nil
 		}
-		return tlsClientHandshake(conn, tlsConfig, timeout)
+		return tlsClientHandshake(conn, tlsConfig, *clientHelloID, clientHelloSpec, timeout)
 	}
 	return conn, nil
 }
@@ -2290,6 +2323,8 @@ type pipelineConnClient struct {
 	DisablePathNormalizing        bool
 	IsTLS                         bool
 	TLSConfig                     *tls.Config
+	ClientHelloID                 *tls.ClientHelloID
+	ClientHelloSpec               tls.ClientHelloSpec
 	MaxIdleConnDuration           time.Duration
 	ReadBufferSize                int
 	WriteBufferSize               int
@@ -2596,7 +2631,7 @@ func (c *pipelineConnClient) init() {
 
 func (c *pipelineConnClient) worker() error {
 	tlsConfig := c.cachedTLSConfig()
-	conn, err := dialAddr(c.Addr, c.Dial, c.DialDualStack, c.IsTLS, tlsConfig, c.WriteTimeout)
+	conn, err := dialAddr(c.Addr, c.Dial, c.DialDualStack, c.IsTLS, tlsConfig, c.ClientHelloID, c.ClientHelloSpec, c.WriteTimeout)
 	if err != nil {
 		return err
 	}

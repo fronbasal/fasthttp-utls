@@ -3,7 +3,6 @@ package fasthttp
 import (
 	"bufio"
 	"bytes"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -17,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	tls "github.com/refraction-networking/utls"
 	"github.com/valyala/fasthttp/fasthttputil"
 )
 
