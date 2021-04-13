@@ -2003,10 +2003,7 @@ func dialAddr(addr string, dial DialFunc, dialDualStack, isTLS bool, tlsConfig *
 		}
 		addr = addMissingPort(addr, isTLS)
 	}
-	// use HelloChrome_Auto by default
-	if clientHelloID == nil {
-		clientHelloID = &tls.HelloChrome_Auto
-	}
+	
 	conn, err := dial(addr)
 	if err != nil {
 		return nil, err
