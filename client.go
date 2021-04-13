@@ -1966,14 +1966,13 @@ func tlsClientHandshake(rawConn net.Conn, tlsConfig *tls.Config, clientHelloID t
 	ch = chv.(chan error)
 	defer timeoutErrorChPool.Put(chv)
 
-	conn := tls.UClient(rawConn, tlsConfig, clientHelloID)
-	// Use uTLS client here
+	var conn *tls.UConn
+
 	if &clientHelloSpec != nil {
 		conn = tls.UClient(rawConn, tlsConfig, clientHelloID)
-		err := conn.ApplyPreset(&clientHelloSpec)
-		if err != nil {
-			return nil, err
-		}
+		conn.ApplyPreset(&clientHelloSpec)
+	} else {
+		conn = tls.UClient(rawConn, tlsConfig, clientHelloID)
 	}
 
 	go func() {
@@ -2003,7 +2002,12 @@ func dialAddr(addr string, dial DialFunc, dialDualStack, isTLS bool, tlsConfig *
 		}
 		addr = addMissingPort(addr, isTLS)
 	}
-	
+
+	// use randomized HelloRandomizedALPN by default
+	if clientHelloID == nil {
+		clientHelloID = &tls.HelloRandomizedALPN
+	}
+
 	conn, err := dial(addr)
 	if err != nil {
 		return nil, err
